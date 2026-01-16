@@ -1,11 +1,16 @@
 import asyncio
 import os
 from pathlib import Path
+import subprocess
+import tempfile
+import html
+import re
 from typing import Optional
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
+from aiogram.types import FSInputFile
 from aiogram.types import Message
 from dotenv import load_dotenv
 
@@ -16,6 +21,8 @@ KRASNODAR: dict[str, float] = {
     "longitude": 38.9753,
 }
 
+LIBRE_TRANSLATE_URL = "https://libretranslate.de/translate"
+GOOGLE_MOBILE_TRANSLATE_URL = "https://translate.google.com/m"
 
 def _weather_code_to_ru(weather_code: int) -> str:
     """Преобразует код погоды Open-Meteo в описание на русском."""
@@ -105,6 +112,90 @@ async def _fetch_krasnodar_weather() -> str:
     return "\n".join(parts)
 
 
+def _is_ffmpeg_available() -> bool:
+    """Проверяет, доступен ли ffmpeg в PATH."""
+
+    try:
+        subprocess.run(
+            ["ffmpeg", "-version"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        return False
+
+    return True
+
+
+async def _translate_to_english(text: str) -> str:
+    """Переводит текст на английский через бесплатные публичные API."""
+
+    timeout = aiohttp.ClientTimeout(total=15)
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        try:
+            async with session.get(
+                GOOGLE_MOBILE_TRANSLATE_URL,
+                params={
+                    "sl": "auto",
+                    "tl": "en",
+                    "q": text,
+                },
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/120.0.0.0 Safari/537.36"
+                    )
+                },
+            ) as response:
+                response.raise_for_status()
+                page = await response.text()
+
+            match = re.search(r'class="result-container">(.*?)<', page)
+            if match:
+                translated = html.unescape(match.group(1)).strip()
+                if translated:
+                    return translated
+        except (aiohttp.ClientError, re.error):
+            pass
+
+        payload = {
+            "q": text,
+            "source": "auto",
+            "target": "en",
+            "format": "text",
+        }
+        async with session.post(LIBRE_TRANSLATE_URL, json=payload) as response:
+            response.raise_for_status()
+            data = await response.json(content_type=None)
+
+    translated = data.get("translatedText")
+    if not isinstance(translated, str) or not translated.strip():
+        raise ValueError("Пустой перевод")
+
+    return translated.strip()
+
+
+def _synthesize_tts_mp3(text: str, mp3_path: Path) -> None:
+    """Синтезирует английскую речь в MP3."""
+
+    from gtts import gTTS
+
+    tts = gTTS(text=text, lang="en")
+    tts.save(str(mp3_path))
+
+
+def _convert_mp3_to_ogg_opus(mp3_path: Path, ogg_path: Path) -> None:
+    """Конвертирует MP3 в OGG/OPUS (для voice-сообщений Telegram)."""
+
+    from pydub import AudioSegment
+
+    audio = AudioSegment.from_file(mp3_path, format="mp3")
+    audio.export(str(ogg_path), format="ogg", codec="libopus")
+
+
 def _get_token() -> str:
     """Возвращает токен бота из окружения."""
 
@@ -159,11 +250,77 @@ async def weather(message: Message) -> None:
 
 @dp.message(Command("help"))
 async def help(message: Message) -> None:
-    await message.answer("Команды:\n/start\n/help\n/weather")
+    await message.answer("Команды:\n/start\n/help\n/weather\n/voice")
 
 @dp.message(CommandStart())
 async def start(message: Message) -> None:
     await message.answer(f"Приветствую, {message.from_user.first_name}")
+
+
+@dp.message(Command("voice"))
+async def voice(message: Message) -> None:
+    if message.reply_to_message and message.reply_to_message.voice:
+        await message.answer_voice(message.reply_to_message.voice.file_id)
+        return
+
+    if not message.text:
+        await message.answer(
+            "Чтобы отправить голосовое, используйте:\n"
+            "/voice <file_id|url>\n"
+            "или ответьте на голосовое и отправьте /voice"
+        )
+        return
+
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer(
+            "Чтобы отправить голосовое, используйте:\n"
+            "/voice <file_id|url>\n"
+            "или ответьте на голосовое и отправьте /voice"
+        )
+        return
+
+    voice_id_or_url = parts[1].strip()
+    await message.answer_voice(voice_id_or_url)
+
+
+@dp.message(F.text & ~F.text.startswith("/"))
+async def translate_and_voice(message: Message) -> None:
+    if not message.text or not message.text.strip():
+        return
+
+    source_text = message.text.strip()
+
+    try:
+        translated = await _translate_to_english(source_text)
+    except aiohttp.ClientError:
+        await message.answer("Не удалось перевести текст: ошибка сети/сервиса.")
+        return
+    except (asyncio.TimeoutError, ValueError):
+        await message.answer("Не удалось перевести текст.")
+        return
+
+    await message.answer(translated)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        mp3_path = Path(tmp_dir) / "tts.mp3"
+        ogg_path = Path(tmp_dir) / "tts.ogg"
+
+        try:
+            _synthesize_tts_mp3(translated, mp3_path)
+        except Exception:
+            await message.answer("Не удалось озвучить текст.")
+            return
+
+        if _is_ffmpeg_available():
+            try:
+                _convert_mp3_to_ogg_opus(mp3_path, ogg_path)
+                await message.answer_voice(FSInputFile(str(ogg_path)))
+                return
+            except Exception:
+                pass
+
+        await message.answer_audio(FSInputFile(str(mp3_path)))
 
 
 async def main() -> None:
